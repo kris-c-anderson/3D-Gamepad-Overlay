@@ -11,6 +11,10 @@
 #include "settings_window.h"
 #include "strings.h"
 
+#include <algorithm>
+#include <cmath>
+#include <fstream>
+
 std::string mesh_filenames[MESH_COUNT] = {
     "top_shell.obj",
     "bottom_shell.obj",
@@ -217,6 +221,80 @@ std::vector<Texture> textures;
 ImVec4 clear_color = ImVec4(0.05f, 0.05f, 0.05f, 1.00f);
 ImGuiIO* io;
 
+// ---------------------------------------------------------------------------
+// HiDPI support. GLFW marks the process as per-monitor DPI aware, so Windows
+// no longer enlarges the window for us; the UI has to scale itself with the
+// monitor's content scale (125%, 150%, 200% ...). The user can apply an extra
+// multiplier in the "Interface" section, saved next to the executable.
+// ---------------------------------------------------------------------------
+float monitor_ui_scale = 1.0f;   // from the OS (window content scale)
+float user_ui_scale = 1.0f;      // user multiplier
+float applied_ui_scale = 0.0f;   // what the fonts/style are currently built for
+bool ui_scale_dirty = true;
+
+static std::string ui_scale_file_path(){
+	std::string path = SDL_GetBasePath() ? SDL_GetBasePath() : "";
+	path.append("interface.txt");
+	return path;
+}
+
+static void load_user_ui_scale(){
+	std::ifstream f(ui_scale_file_path());
+	float v = 0.0f;
+	if(f && (f >> v) && v >= 0.5f && v <= 3.0f)
+		user_ui_scale = v;
+}
+
+static void save_user_ui_scale(){
+	std::ofstream f(ui_scale_file_path());
+	if(f)
+		f << user_ui_scale << "\n";
+}
+
+static void settings_content_scale_callback(GLFWwindow* window, float xscale, float yscale){
+	monitor_ui_scale = std::max(xscale, yscale);
+	ui_scale_dirty = true;
+}
+
+// Rebuilds the font atlas and style for the current scale. Must be called
+// between frames (outside NewFrame/Render).
+static void apply_ui_scale(){
+	float scale = std::clamp(monitor_ui_scale * user_ui_scale, 0.5f, 4.0f);
+	ui_scale_dirty = false;
+	if(fabs(scale - applied_ui_scale) < 0.001f)
+		return;
+	applied_ui_scale = scale;
+
+	ImGuiIO& the_io = ImGui::GetIO();
+	the_io.Fonts->Clear();
+	ImFont* font = nullptr;
+	#if defined(_WIN32)
+	// Segoe UI (the Windows UI font) stays crisp at any size; fall back to the
+	// built-in bitmap-style font if it isn't there.
+	std::string windir = getenv("WINDIR") ? getenv("WINDIR") : "C:\\Windows";
+	std::string segoe = windir + "\\Fonts\\segoeui.ttf";
+	struct stat sb;
+	if(stat(segoe.c_str(), &sb) == 0)
+		font = the_io.Fonts->AddFontFromFileTTF(segoe.c_str(), std::round(15.0f * scale));
+	#endif
+	if(font == nullptr){
+		ImFontConfig config;
+		config.SizePixels = std::round(13.0f * scale);
+		the_io.Fonts->AddFontDefault(&config);
+	}
+	the_io.Fonts->Build();
+	ImGui_ImplOpenGL3_DestroyFontsTexture();
+	ImGui_ImplOpenGL3_CreateFontsTexture();
+
+	ImGuiStyle fresh;
+	ImGui::StyleColorsDark(&fresh);
+	fresh.ScaleAllSizes(scale);
+	ImGui::GetStyle() = fresh;
+
+	texture_dialog.SetWindowSize((int)(400 * scale), (int)(300 * scale));
+	model_dialog.SetWindowSize((int)(400 * scale), (int)(300 * scale));
+}
+
 void createSettingsWindow(){
     glfwInit();
 
@@ -241,8 +319,10 @@ void createSettingsWindow(){
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
 	#endif
 	glfwWindowHint(GLFW_TRANSPARENT_FRAMEBUFFER, 1);
+	glfwWindowHint(GLFW_SCALE_TO_MONITOR, GLFW_TRUE); // 640x480 at 100%, bigger on HiDPI screens
 
 	glfw_settings_window = glfwCreateWindow(640, 480, "3D Controller Overlay", NULL, NULL);
+	glfwWindowHint(GLFW_SCALE_TO_MONITOR, GLFW_FALSE); // controller windows keep their saved pixel sizes
     if (glfw_settings_window == NULL)
     {
         std::cout << "Failed to create settings window" << std::endl;
@@ -290,6 +370,13 @@ void createSettingsWindow(){
 	model_dialog.SetWindowSize(400, 300);
     model_dialog.SetTitle("Select Model File");
     model_dialog.SetTypeFilters({ ".obj" });
+
+	float xs = 1.0f, ys = 1.0f;
+	glfwGetWindowContentScale(glfw_settings_window, &xs, &ys);
+	monitor_ui_scale = std::max(xs, ys);
+	glfwSetWindowContentScaleCallback(glfw_settings_window, settings_content_scale_callback);
+	load_user_ui_scale();
+	ui_scale_dirty = true;
 }
 
 GLFWwindow* getSettingsWindow(){
@@ -355,6 +442,9 @@ void drawSettingsWindow(){
     glfwMakeContextCurrent(glfw_settings_window);
 	glfwSwapInterval(1);
 	
+	if(ui_scale_dirty)
+		apply_ui_scale();
+
 	ImGui_ImplOpenGL3_NewFrame();
     ImGui_ImplGlfw_NewFrame();
 	ImGui::NewFrame();
@@ -1394,6 +1484,23 @@ void drawSettingsWindow(){
 			if (ImGui::Button("Default")){
                 if(!current_window->default_mapping.empty())
 					SDL_AddGamepadMapping(current_window->default_mapping.c_str());
+			}
+		}
+		if (ImGui::CollapsingHeader("Interface")){
+			int percent = (int)std::round(user_ui_scale * 100.0f);
+			if (ImGui::SliderInt("Interface Scale", &percent, 50, 300, "%d%%")){
+				user_ui_scale = percent / 100.0f;
+			}
+			if (ImGui::IsItemDeactivatedAfterEdit()){
+				ui_scale_dirty = true;
+				save_user_ui_scale();
+			}
+			if (ImGui::IsItemHovered())
+				ImGui::SetTooltip("Extra size on top of your Windows display scaling (currently %d%%).", (int)std::round(monitor_ui_scale * 100.0f));
+			if (ImGui::Button("Reset Scale")){
+				user_ui_scale = 1.0f;
+				ui_scale_dirty = true;
+				save_user_ui_scale();
 			}
 		}
 		if (ImGui::CollapsingHeader("Help")){

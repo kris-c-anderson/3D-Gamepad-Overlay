@@ -14,7 +14,7 @@ Valve publishes the controller as a single fused solid. This script:
      info.txt with pivots, travel, popup poses and trackpad geometry.
 
 Usage:
-  pip install numpy scipy trimesh pyfqmr
+  pip install numpy scipy trimesh shapely pymeshlab mapbox_earcut
   python3 convert_valve_cad.py sc_solid_stl_20260429.stl "../../models/Steam Controller (2026)"
 """
 import math
@@ -26,14 +26,29 @@ import trimesh
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
 
-try:
-    import pyfqmr
-except ImportError:
-    pyfqmr = None
+import mapbox_earcut
+import pymeshlab
 
 S = 0.013                               # overlay units per mm (same scale as the DualSense model)
 CENTER = np.array([0.0, -24.0, 49.6])   # CAD point that becomes the overlay origin (≈ centre of mass)
 CREASE_DEG = 25.0
+
+# Triangle budgets after decimation (quadric edge collapse keeps curvature,
+# collapses flat areas into large triangles).
+BUDGET = {
+    "shell": 24000,
+    "extra.obj": 120,
+    "touchpad.obj": 700, "touchpad2.obj": 700,
+    "left_trigger.obj": 1200, "right_trigger.obj": 1200,
+    "left_bumper.obj": 900, "right_bumper.obj": 900,
+    "dpad": 900,
+    "left_ring.obj": 1000, "right_ring.obj": 1000,
+    "left_cap.obj": 250, "right_cap.obj": 250,
+    "left_stick.obj": 300, "right_stick.obj": 300,
+    "paddle1.obj": 500, "paddle2.obj": 500, "paddle3.obj": 500, "paddle4.obj": 500,
+    "a_button.obj": 400, "b_button.obj": 400, "x_button.obj": 400, "y_button.obj": 400,
+    "guide_button.obj": 600, "misc.obj": 350, "back_button.obj": 280, "start_button.obj": 280,
+}
 
 
 def to_overlay(p):
@@ -71,6 +86,7 @@ ANCHORS = {
     "misc.obj":          [(0.0, -6.3, 61.9, 102)],     # QAM (…)
     "back_button.obj":   [(-28.3, -0.25, 8.6, 61)],    # View
     "start_button.obj":  [(28.3, -0.25, 8.6, 61)],     # Menu
+    "extra.obj":         [(0.0, -0.5, 8.7, 1.9)],      # status LED
 }
 
 
@@ -153,40 +169,58 @@ def boundary_loops(mesh):
     return loops
 
 
-def cap_holes(mesh, outward_hint):
-    """Fan-fill every open loop. outward_hint(loop_centre, loop_normal) -> +1/-1."""
+def cap_holes(mesh, outward_hint, want=lambda c: True):
+    """Close every open loop with a clean ear-clipped polygon (fan fallback).
+    outward_hint(loop_centre, loop_normal) -> +1/-1 picks the facing side."""
     verts = [mesh.vertices]
     faces = [mesh.faces]
     nv = len(mesh.vertices)
     for loop in boundary_loops(mesh):
-        pts = mesh.vertices[loop]
+        idx = np.array(loop)
+        pts = mesh.vertices[idx]
         c = pts.mean(0)
-        # loop normal (Newell)
-        n = np.zeros(3)
-        for i in range(len(pts)):
-            p, q = pts[i] - c, pts[(i + 1) % len(pts)] - c
-            n += np.cross(p, q)
+        if not want(c):
+            continue
+        n = np.cross(pts - c, np.roll(pts, -1, axis=0) - c).sum(0)   # Newell normal
         if np.linalg.norm(n) < 1e-9:
             continue
         n /= np.linalg.norm(n)
-        idx = np.array(loop)
-        fan = np.stack([np.full(len(idx), nv), idx, np.roll(idx, -1)], 1)
-        if outward_hint(c, n) < 0:
-            fan = fan[:, ::-1]
-        verts.append(c[None])
-        faces.append(fan)
-        nv += 1
+        a = np.cross(n, [1.0, 0.0, 0.0] if abs(n[0]) < 0.9 else [0.0, 1.0, 0.0])
+        a /= np.linalg.norm(a)
+        b = np.cross(n, a)
+        uv = np.stack([(pts - c) @ a, (pts - c) @ b], 1)
+        tris = None
+        try:
+            t = mapbox_earcut.triangulate_float64(uv, np.array([len(uv)], dtype=np.uint32)).reshape(-1, 3)
+            if len(t) == len(uv) - 2:
+                tris = idx[t]
+        except Exception:
+            tris = None
+        if tris is None:   # non-simple projection: fall back to a fan around the centre
+            tris = np.stack([np.full(len(idx), nv), idx, np.roll(idx, -1)], 1)
+            verts.append(c[None])
+            nv += 1
+        g = mesh.vertices if tris.max() < len(mesh.vertices) else np.vstack(verts)
+        tn = np.cross(g[tris[:, 1]] - g[tris[:, 0]], g[tris[:, 2]] - g[tris[:, 0]]).sum(0)
+        if (np.sign(tn.dot(n)) or 1) * outward_hint(c, n) < 0:
+            tris = tris[:, ::-1]
+        faces.append(tris)
     return trimesh.Trimesh(np.vstack(verts), np.vstack(faces), process=False)
 
 
 def decimate(mesh, target):
-    if pyfqmr is None or len(mesh.faces) <= target:
+    """Quadric edge collapse (MeshLab). Open borders may move a little so the
+    dense CAD seams get simplified too; the caps close them afterwards."""
+    if len(mesh.faces) <= target:
         return mesh
-    s = pyfqmr.Simplify()
-    s.setMesh(mesh.vertices.astype(np.float64), mesh.faces.astype(np.int32))
-    s.simplify_mesh(target_count=int(target), aggressiveness=6, preserve_border=True, verbose=False)
-    v, f, _ = s.getMesh()
-    return trimesh.Trimesh(v, f, process=True)
+    ms = pymeshlab.MeshSet()
+    ms.add_mesh(pymeshlab.Mesh(mesh.vertices, mesh.faces))
+    ms.meshing_decimation_quadric_edge_collapse(
+        targetfacenum=int(target), qualitythr=0.6, preserveboundary=False, boundaryweight=4.0,
+        preservenormal=True, preservetopology=True, optimalplacement=True,
+        planarquadric=True, planarweight=0.002, autoclean=True)
+    m = ms.current_mesh()
+    return trimesh.Trimesh(m.vertex_matrix(), m.face_matrix(), process=True)
 
 
 def write_obj(path, mesh, origin_cad, rotate=None):
@@ -263,7 +297,8 @@ def main(stl_path, out_dir):
 
     parts = {}
     for p in sorted(set(x for x in face_part if x is not None)):
-        parts[p] = mesh.submesh([np.where(face_part == p)[0]], append=True)
+        sub = mesh.submesh([np.where(face_part == p)[0]], append=True)
+        parts[p] = decimate(sub, BUDGET[p])
 
     # split the D-pad cross into four arms
     dpad = parts.pop("dpad")
@@ -277,26 +312,38 @@ def main(stl_path, out_dir):
 
     # cap the parts' open backs (outward = away from the part's own centre)
     uncapped = {name: m.copy() for name, m in parts.items()}
+    # Only the stick stems need closing: they tilt, so their open base and the
+    # hole they leave in the shell can come into view. Everything else only
+    # presses straight into the body (or pops up with its back facing away),
+    # so its seam is never exposed and extra caps would just clutter the mesh.
     for name in list(parts):
-        if name.endswith("_ring.obj") or name.endswith("_cap.obj"):
-            continue   # covered by the neighbouring stick part; a flat fill would z-fight with the concave cap
+        if not name.endswith("_stick.obj"):
+            continue
         pc = parts[name].bounds.mean(0)
         parts[name] = cap_holes(parts[name], lambda c, n, pc=pc: np.sign(n.dot(c - pc)) or 1)
 
     # shell = everything else; cap where parts were removed (outward = towards the part)
     shell = mesh.submesh([np.where(face_part == None)[0]], append=True)  # noqa: E711
+    shell = decimate(shell, BUDGET["shell"])
     part_centres = np.array([parts[p].bounds.mean(0) for p in parts])
 
     def shell_hint(c, n):
         pc = part_centres[np.argmin(np.linalg.norm(part_centres - c, axis=1))]
         return np.sign(n.dot(pc - c)) or 1
-    shell = cap_holes(shell, shell_hint)
+    # close the shell behind parts that tilt or pop out (sticks, shoulder and
+    # grip buttons); face buttons/pads only sink in, their seams stay hidden
+    exposed = [p for p in parts if p.endswith(("_stick.obj", "_trigger.obj", "_bumper.obj")) or p.startswith("paddle")]
+    exposed_lo = np.array([parts[p].bounds[0] for p in exposed]) - 1.0
+    exposed_hi = np.array([parts[p].bounds[1] for p in exposed]) + 1.0
+    near_exposed = lambda c: bool(np.any(np.all((c >= exposed_lo) & (c <= exposed_hi), axis=1)))
+    shell = cap_holes(shell, shell_hint, want=near_exposed)
 
     # top / bottom shell split along a plane that follows the face slope
-    tc = shell.triangles_center
-    top_mask = tc[:, 1] > (-8.0 - 0.18 * tc[:, 2])
-    top = shell.submesh([np.where(top_mask)[0]], append=True)
-    bottom = shell.submesh([np.where(~top_mask)[0]], append=True)
+    # (exact plane cut, so the colour seam is a clean line even on big triangles)
+    seam_n = np.array([0.0, 1.0, 0.18]); seam_n /= np.linalg.norm(seam_n)
+    seam_o = np.array([0.0, -8.0, 0.0])
+    top = trimesh.intersections.slice_mesh_plane(shell, seam_n, seam_o)
+    bottom = trimesh.intersections.slice_mesh_plane(shell, -seam_n, seam_o)
 
     info = {}
 
@@ -305,10 +352,12 @@ def main(stl_path, out_dir):
         info[name] = [*position, *travel, *popup_offset, *popup_rotation, trigger_max, stick_max, touch_w, touch_h]
 
     print("writing meshes")
-    write_obj(os.path.join(out_dir, "top_shell.obj"), decimate(top, 40000), CENTER)
-    write_obj(os.path.join(out_dir, "bottom_shell.obj"), decimate(bottom, 22000), CENTER)
+    write_obj(os.path.join(out_dir, "top_shell.obj"), top, CENTER)
+    write_obj(os.path.join(out_dir, "bottom_shell.obj"), bottom, CENTER)
     entry("top_shell.obj")
     entry("bottom_shell.obj")
+    write_obj(os.path.join(out_dir, "extra.obj"), parts["extra.obj"], CENTER)
+    entry("extra.obj")
 
     # face buttons: static position, travel straight into the face
     for name, depth in (("a_button.obj", 0.8), ("b_button.obj", 0.8), ("x_button.obj", 0.8), ("y_button.obj", 0.8),
@@ -317,7 +366,7 @@ def main(stl_path, out_dir):
                         ("dpad_left.obj", 0.6), ("dpad_right.obj", 0.6)):
         m = parts[name]
         n = mean_normal(m, m.face_normals[:, 1] > 0.5)
-        write_obj(os.path.join(out_dir, name), decimate(m, 2500), CENTER)
+        write_obj(os.path.join(out_dir, name), m, CENTER)
         entry(name, travel=tuple(-n * depth * S))
 
     # thumbsticks: stem/ring/cap share a pivot below the stem
@@ -328,7 +377,7 @@ def main(stl_path, out_dir):
         cx, cz = cap.bounds.mean(0)[0], cap.bounds.mean(0)[2]
         pivot = np.array([cx, stem.bounds[0][1] - 5.0, cz])
         for part, tris in (("stick", 2000), ("ring", 4500), ("cap", 2000)):
-            write_obj(os.path.join(out_dir, f"{side}_{part}.obj"), decimate(parts[f"{side}_{part}.obj"], tris), pivot)
+            write_obj(os.path.join(out_dir, f"{side}_{part}.obj"), parts[f"{side}_{part}.obj"], pivot)
             entry(f"{side}_{part}.obj", position=tuple(to_overlay(pivot)), stick_max=stick_max)
 
     # trackpads + touch points (touch points move in the tilted plane of their pad)
@@ -363,14 +412,14 @@ def main(stl_path, out_dir):
         centre = top_pts.mean(0) + n * 0.15
         surf = top_pts[np.argmin(np.linalg.norm(top_pts - centre, axis=1))]
         centre = centre + n * ((surf - centre).dot(n) + 0.25)
-        write_obj(os.path.join(out_dir, pad_name), decimate(pad, 7000), CENTER)
+        write_obj(os.path.join(out_dir, pad_name), pad, CENTER)
         entry(pad_name, travel=tuple(-n * 0.5 * S))
         # local frame -> world: columns (u, n, v)
         R = np.stack([u, n, v], 1)
         a, b, c = euler_xyz(R)
         assert np.allclose(rot_x(a) @ rot_y(b) @ rot_z(c), R, atol=1e-6)
         disc_r = 3.4
-        disc = trimesh.creation.cylinder(radius=disc_r, height=0.35, sections=48)
+        disc = trimesh.creation.cylinder(radius=disc_r, height=0.35, sections=24)
         disc.apply_transform(trimesh.transformations.rotation_matrix(-math.pi / 2, [1, 0, 0]))  # axis -> +Y
         disc.apply_translation([0, 0.175, 0])
         disc_world = disc.copy()
@@ -384,13 +433,13 @@ def main(stl_path, out_dir):
     for side, sgn in (("left", -1), ("right", 1)):
         bumper = parts[f"{side}_bumper.obj"]
         bc = bumper.bounds.mean(0)
-        write_obj(os.path.join(out_dir, f"{side}_bumper.obj"), decimate(bumper, 4000), bc)
+        write_obj(os.path.join(out_dir, f"{side}_bumper.obj"), bumper, bc)
         entry(f"{side}_bumper.obj", position=tuple(to_overlay(bc)), travel=(0, -0.6 * S, 0.3 * S),
               popup_offset=(0, 18.0 * S, -4.0 * S))
         trig = parts[f"{side}_trigger.obj"]
         lo, hi = trig.bounds
         hinge = np.array([(lo[0] + hi[0]) / 2, hi[1], 6.0])
-        write_obj(os.path.join(out_dir, f"{side}_trigger.obj"), decimate(trig, 5000), hinge)
+        write_obj(os.path.join(out_dir, f"{side}_trigger.obj"), trig, hinge)
         entry(f"{side}_trigger.obj", position=tuple(to_overlay(hinge)), trigger_max=math.radians(18.0),
               popup_offset=(0, (2.0 - hinge[1]) * S, (-9.0 - hinge[2]) * S), popup_rotation=(math.pi / 2, 0, 0))
 
@@ -399,7 +448,7 @@ def main(stl_path, out_dir):
         pdl = parts[name]
         pc = pdl.bounds.mean(0)
         n = mean_normal(uncapped[name])     # the capped mesh is closed, its mean normal ~ 0
-        write_obj(os.path.join(out_dir, name), decimate(pdl, 2500), pc)
+        write_obj(os.path.join(out_dir, name), pdl, pc)
         R = rotation_to(n, np.array([0.0, 1.0, 0.0]))
         a, b, c = euler_xyz(R)
         target = np.array([sgn * 87.0, 4.0, pc[2]])
