@@ -113,19 +113,97 @@ void createControllerWindow(std::string title, std::string model_path){
 	loadModel(w.model, model_path);
 	w.model_name = get_top_folder(model_path);
 		
-	w.sdl_controller = SDL_GameControllerOpen(0);
-	if(w.sdl_controller != NULL){
-		w.default_mapping = SDL_GameControllerMapping(w.sdl_controller);
-		if (SDL_GameControllerHasSensor(w.sdl_controller, SDL_SENSOR_GYRO)){
-			SDL_GameControllerSetSensorEnabled(w.sdl_controller, SDL_SENSOR_GYRO, (SDL_bool)SDL_TRUE);
-		}
-		w.gyro_matrix = glm::mat4(1.0f);
+	SDL_JoystickID default_id = pick_default_gamepad();
+	if(default_id != 0){
+		controller_window_open_gamepad(w, default_id);
 	}else{
-		std::cout << "couldn't open sdl controller." << std::endl;
-		std::cout << SDL_GetError() << std::endl;
+		std::cout << "no gamepad connected yet." << std::endl;
 	}
-	
+
 	windows.push_back(w);
+}
+
+std::string gamepad_name(SDL_Gamepad* gamepad){
+	if(gamepad == nullptr)
+		return "";
+	const char* name = SDL_GetGamepadName(gamepad);
+	return name ? std::string(name) : std::string("Unknown Gamepad");
+}
+
+SDL_JoystickID pick_default_gamepad(){
+	int count = 0;
+	SDL_JoystickID* ids = SDL_GetGamepads(&count);
+	SDL_JoystickID picked = 0;
+	if(ids != nullptr){
+		for(int i = 0; i < count; i++){
+			const char* name = SDL_GetGamepadNameForID(ids[i]);
+			bool is_virtual = name != nullptr && std::string(name).find("Virtual") != std::string::npos;
+			if(!is_virtual){
+				picked = ids[i];
+				break;
+			}
+		}
+		if(picked == 0 && count > 0)
+			picked = ids[0];
+		SDL_free(ids);
+	}
+	return picked;
+}
+
+void controller_window_open_gamepad(controller_window &w, SDL_JoystickID id){
+	SDL_Gamepad* gamepad = SDL_OpenGamepad(id);
+	if(gamepad == nullptr){
+		std::cout << "couldn't open sdl gamepad " << id << ": " << SDL_GetError() << std::endl;
+		return;
+	}
+	// SDL reference-counts opened gamepads, so closing the previous one is safe
+	// even when another window uses the same controller.
+	if(w.sdl_controller != nullptr && w.sdl_controller != gamepad)
+		SDL_CloseGamepad(w.sdl_controller);
+	else if(w.sdl_controller == gamepad)
+		SDL_CloseGamepad(gamepad); // drop the extra reference we just took
+	w.sdl_controller = gamepad;
+
+	char* mapping = SDL_GetGamepadMapping(gamepad);
+	if(mapping != nullptr){
+		w.default_mapping = mapping;
+		SDL_free(mapping);
+	}
+	if(SDL_GamepadHasSensor(gamepad, SDL_SENSOR_GYRO))
+		SDL_SetGamepadSensorEnabled(gamepad, SDL_SENSOR_GYRO, true);
+	if(SDL_GamepadHasSensor(gamepad, SDL_SENSOR_ACCEL))
+		SDL_SetGamepadSensorEnabled(gamepad, SDL_SENSOR_ACCEL, true);
+	w.gyro_time = 0;
+	w.gyro_toggled = true;
+	w.gyro_matrix = glm::mat4(1.0f);
+
+	std::cout << "opened gamepad: " << gamepad_name(gamepad)
+	          << " (touchpads: " << SDL_GetNumGamepadTouchpads(gamepad)
+	          << ", gyro: " << SDL_GamepadHasSensor(gamepad, SDL_SENSOR_GYRO) << ")" << std::endl;
+}
+
+// Integrates one gyro sample (rad/s, SDL axis convention: X right, Y up out of
+// the face, Z towards the player — same as the model space) using the
+// controller's own sensor clock, so it is frame-rate independent.
+static void integrate_gyro_sample(controller_window &w, const float* data, Uint64 sensor_timestamp_ns){
+	if(!w.gyro_enabled)
+		return;
+	if(w.gyro_toggled || w.gyro_time == 0 || sensor_timestamp_ns <= w.gyro_time){
+		w.gyro_time = sensor_timestamp_ns;
+		w.gyro_toggled = false;
+		return;
+	}
+	double dt = (double)(sensor_timestamp_ns - w.gyro_time) * 1e-9;
+	w.gyro_time = sensor_timestamp_ns;
+	if(dt > 0.25) // stalled stream / reconnect — don't apply a huge jump
+		return;
+	w.gyro_data[0] = data[0];
+	w.gyro_data[1] = data[1];
+	w.gyro_data[2] = data[2];
+	glm::vec3 omega(data[0], data[1], data[2]);
+	float angle = glm::length(omega) * (float)dt;
+	if(angle > 1e-7f)
+		w.gyro_matrix = glm::rotate(w.gyro_matrix, angle, omega / glm::length(omega));
 }
 
 void lightingSpecification(controller_window &w){
@@ -221,129 +299,132 @@ controller_window* getControllerWindow(unsigned ID){
 	return nullptr;
 }
 
+// Valve controllers (Steam Deck, Steam Controller 2026) report capacitive
+// thumbstick touch on MISC3 (left) / MISC4 (right) and grip touch on
+// MISC5 (left) / MISC6 (right). Other brands use those slots for unrelated
+// buttons, so only interpret them as touch sensors for Valve hardware.
+static bool gamepad_has_valve_capsense(SDL_Gamepad* gamepad){
+	return gamepad != nullptr && SDL_GetGamepadVendor(gamepad) == 0x28DE;
+}
+
+static void update_touch_point(Mesh &point, Mesh &pad, SDL_Gamepad* gamepad, int touchpad, int finger){
+	bool down = false;
+	float x = 0.0f, y = 0.0f;
+	if(!SDL_GetGamepadTouchpadFinger(gamepad, touchpad, finger, &down, &x, &y, nullptr))
+		down = false;
+	point.touch_state = down ? 1 : 0;
+	if(down){
+		point.touch_X = x;
+		point.touch_Y = y;
+		point.highlight_value = pad.press > 0.0f ? 0.0f : 1.0f;
+		point.visible = true;
+	}else{
+		point.highlight_value = 0.0f;
+		point.visible = false;
+	}
+}
+
 void controller_window_input(){
 	SDL_PumpEvents();
 	for(unsigned i = 0; i<windows.size(); ++i){
-		//GYROSCOPE
-		//if (SDL_GameControllerHasSensor(windows[i].sdl_controller, SDL_SENSOR_GYRO) && SDL_GameControllerIsSensorEnabled(windows[i].sdl_controller, SDL_SENSOR_GYRO)){
-		if (windows[i].gyro_enabled){
-			Uint64 timestamp;
-			int error = SDL_GameControllerGetSensorDataWithTimestamp(windows[i].sdl_controller, SDL_SENSOR_GYRO, &timestamp, windows[i].gyro_data, 3);
-			if (!error && windows[i].gyro_data[0] + windows[i].gyro_data[1] + windows[i].gyro_data[2] != 0){
-				if (windows[i].gyro_toggled){
-					windows[i].gyro_time = timestamp;
-					windows[i].gyro_toggled = false;
-				}else{
-        			windows[i].gyro_matrix = glm::rotate(windows[i].gyro_matrix, windows[i].gyro_data[0] * (timestamp - windows[i].gyro_time) * 0.000001f, glm::vec3(1.0f, 0.0f, 0.0f));
-					windows[i].gyro_matrix = glm::rotate(windows[i].gyro_matrix, windows[i].gyro_data[1] * (timestamp - windows[i].gyro_time) * 0.000001f, glm::vec3(0.0f, 1.0f, 0.0f));
-        			windows[i].gyro_matrix = glm::rotate(windows[i].gyro_matrix, windows[i].gyro_data[2] * (timestamp - windows[i].gyro_time) * 0.000001f, glm::vec3(0.0f, 0.0f, 1.0f));
-					windows[i].gyro_time = timestamp;
-
-					//GYRO CORRECTION
-					glm::vec3 controller_up = glm::vec3(0.0f, 1.0f, 0.0f) * glm::mat3(windows[i].gyro_matrix);
-					glm::vec3 up_error_axis = glm::cross(glm::vec3(0.0f, 1.0f, 0.0f), glm::vec3(controller_up));
-					windows[i].gyro_matrix = glm::rotate(windows[i].gyro_matrix, windows[i].gyro_correction * 0.0001f, up_error_axis);
-					
-					glm::vec3 controller_right = glm::vec3(1.0f, 0.0f, 0.0f) * glm::mat3(windows[i].gyro_matrix);
-					glm::vec3 right_error_axis = glm::cross(glm::vec3(1.0f, 0.0f, 0.0f), controller_right);
-					windows[i].gyro_matrix = glm::rotate(windows[i].gyro_matrix, windows[i].gyro_correction * 0.0001f, right_error_axis);
-					
-					//RESET GYRO BUTTON COMBO
-					if (windows[i].reset_gyro_button1 > -1 && windows[i].reset_gyro_button2 > -1){
-						if(SDL_GameControllerGetButton(windows[i].sdl_controller, (SDL_GameControllerButton)windows[i].reset_gyro_button1) &&
-						   SDL_GameControllerGetButton(windows[i].sdl_controller, (SDL_GameControllerButton)windows[i].reset_gyro_button2)){
-							windows[i].gyro_matrix = glm::mat4(1.0f);
-						}
-					}
-				}
-        	}
+		controller_window &w = windows[i];
+		SDL_Gamepad* gp = w.sdl_controller;
+		std::vector<Mesh> &meshes = w.model.meshes;
+		if(meshes.size() < MESH_COUNT)
+			continue;
+		if(gp == nullptr){
+			// no controller: don't leave touch markers floating on the pads
+			meshes[MESH_TOUCH_POINT1].visible = false;
+			meshes[MESH_TOUCH_POINT2].visible = false;
+			continue;
 		}
-		//ACCELOROMETER
-		if (SDL_GameControllerHasSensor(windows[i].sdl_controller, SDL_SENSOR_ACCEL) && SDL_GameControllerIsSensorEnabled(windows[i].sdl_controller, SDL_SENSOR_ACCEL)){
-			//std::cout << "controller has accelerometer." << std::endl;
+		//GYROSCOPE (samples are integrated as they arrive, see controller_sdl_events)
+		if (w.gyro_enabled){
+			//GYRO CORRECTION (slowly pulls the overlay back to its rest pose to cancel drift)
+			float step = w.gyro_correction * 0.0001f;
+			glm::vec3 controller_up = glm::vec3(0.0f, 1.0f, 0.0f) * glm::mat3(w.gyro_matrix);
+			glm::vec3 up_error_axis = glm::cross(glm::vec3(0.0f, 1.0f, 0.0f), glm::vec3(controller_up));
+			float up_error = glm::length(up_error_axis);
+			if (step > 0.0f && up_error > 1e-6f)
+				w.gyro_matrix = glm::rotate(w.gyro_matrix, std::min(step, up_error), up_error_axis / up_error);
+			
+			glm::vec3 controller_right = glm::vec3(1.0f, 0.0f, 0.0f) * glm::mat3(w.gyro_matrix);
+			glm::vec3 right_error_axis = glm::cross(glm::vec3(1.0f, 0.0f, 0.0f), controller_right);
+			float right_error = glm::length(right_error_axis);
+			if (step > 0.0f && right_error > 1e-6f)
+				w.gyro_matrix = glm::rotate(w.gyro_matrix, std::min(step, right_error), right_error_axis / right_error);
+			
+			//RESET GYRO BUTTON COMBO
+			if (w.reset_gyro_button1 > -1 && w.reset_gyro_button2 > -1){
+				if(SDL_GetGamepadButton(gp, (SDL_GamepadButton)w.reset_gyro_button1) &&
+				   SDL_GetGamepadButton(gp, (SDL_GamepadButton)w.reset_gyro_button2)){
+					w.gyro_matrix = glm::mat4(1.0f);
+				}
+			}
 		}
 		//LEFT STICK
-		windows[i].model.meshes[5].stick_X = SDL_GameControllerGetAxis(windows[i].sdl_controller, SDL_CONTROLLER_AXIS_LEFTX);
-		windows[i].model.meshes[5].stick_Y = SDL_GameControllerGetAxis(windows[i].sdl_controller, SDL_CONTROLLER_AXIS_LEFTY);
-		windows[i].model.meshes[7].stick_X = SDL_GameControllerGetAxis(windows[i].sdl_controller, SDL_CONTROLLER_AXIS_LEFTX);
-		windows[i].model.meshes[7].stick_Y = SDL_GameControllerGetAxis(windows[i].sdl_controller, SDL_CONTROLLER_AXIS_LEFTY);
-		windows[i].model.meshes[16].stick_X = SDL_GameControllerGetAxis(windows[i].sdl_controller, SDL_CONTROLLER_AXIS_LEFTX);
-		windows[i].model.meshes[16].stick_Y = SDL_GameControllerGetAxis(windows[i].sdl_controller, SDL_CONTROLLER_AXIS_LEFTY);
-		if (abs(windows[i].model.meshes[7].stick_X / 32767) > windows[i].model.meshes[7].ring_highlight_deadzone * 0.01 || 
-			abs(windows[i].model.meshes[7].stick_Y / 32767) > windows[i].model.meshes[7].ring_highlight_deadzone * 0.01){
-			windows[i].model.meshes[7].highlight_value = std::max(abs(windows[i].model.meshes[7].stick_X / 32767), abs(windows[i].model.meshes[7].stick_Y / 32767)) * 1.2f;
+		float lx = SDL_GetGamepadAxis(gp, SDL_GAMEPAD_AXIS_LEFTX);
+		float ly = SDL_GetGamepadAxis(gp, SDL_GAMEPAD_AXIS_LEFTY);
+		meshes[5].stick_X = lx;  meshes[5].stick_Y = ly;
+		meshes[7].stick_X = lx;  meshes[7].stick_Y = ly;
+		meshes[16].stick_X = lx; meshes[16].stick_Y = ly;
+		if (fabs(lx / 32767) > meshes[7].ring_highlight_deadzone * 0.01 || 
+			fabs(ly / 32767) > meshes[7].ring_highlight_deadzone * 0.01){
+			meshes[7].highlight_value = std::max(fabs(lx / 32767), fabs(ly / 32767)) * 1.2f;
 		}else{
-			windows[i].model.meshes[7].highlight_value = 0.0f;
+			meshes[7].highlight_value = 0.0f;
 		}
 		//RIGHT STICK
-		windows[i].model.meshes[6].stick_X = SDL_GameControllerGetAxis(windows[i].sdl_controller, SDL_CONTROLLER_AXIS_RIGHTX);
-		windows[i].model.meshes[6].stick_Y = SDL_GameControllerGetAxis(windows[i].sdl_controller, SDL_CONTROLLER_AXIS_RIGHTY);
-		windows[i].model.meshes[8].stick_X = SDL_GameControllerGetAxis(windows[i].sdl_controller, SDL_CONTROLLER_AXIS_RIGHTX);
-		windows[i].model.meshes[8].stick_Y = SDL_GameControllerGetAxis(windows[i].sdl_controller, SDL_CONTROLLER_AXIS_RIGHTY);
-		windows[i].model.meshes[17].stick_X = SDL_GameControllerGetAxis(windows[i].sdl_controller, SDL_CONTROLLER_AXIS_RIGHTX);
-		windows[i].model.meshes[17].stick_Y = SDL_GameControllerGetAxis(windows[i].sdl_controller, SDL_CONTROLLER_AXIS_RIGHTY);
-		if (abs(windows[i].model.meshes[8].stick_X / 32767) > windows[i].model.meshes[8].ring_highlight_deadzone * 0.01 || 
-			abs(windows[i].model.meshes[8].stick_Y / 32767) > windows[i].model.meshes[8].ring_highlight_deadzone * 0.01){
-			windows[i].model.meshes[8].highlight_value = std::max(abs(windows[i].model.meshes[8].stick_X / 32767), abs(windows[i].model.meshes[8].stick_Y / 32767)) * 1.2f;
+		float rx = SDL_GetGamepadAxis(gp, SDL_GAMEPAD_AXIS_RIGHTX);
+		float ry = SDL_GetGamepadAxis(gp, SDL_GAMEPAD_AXIS_RIGHTY);
+		meshes[6].stick_X = rx;  meshes[6].stick_Y = ry;
+		meshes[8].stick_X = rx;  meshes[8].stick_Y = ry;
+		meshes[17].stick_X = rx; meshes[17].stick_Y = ry;
+		if (fabs(rx / 32767) > meshes[8].ring_highlight_deadzone * 0.01 || 
+			fabs(ry / 32767) > meshes[8].ring_highlight_deadzone * 0.01){
+			meshes[8].highlight_value = std::max(fabs(rx / 32767), fabs(ry / 32767)) * 1.2f;
 		}else{
-			windows[i].model.meshes[8].highlight_value = 0.0f;
+			meshes[8].highlight_value = 0.0f;
 		}
 		//LEFT TRIGGER
-		windows[i].model.meshes[3].pull = SDL_GameControllerGetAxis(windows[i].sdl_controller, SDL_CONTROLLER_AXIS_TRIGGERLEFT);
-		windows[i].model.meshes[3].highlight_value = windows[i].model.meshes[3].pull / 32767;
-		windows[i].model.meshes[3].press = windows[i].model.meshes[3].highlight_value;
+		meshes[3].pull = SDL_GetGamepadAxis(gp, SDL_GAMEPAD_AXIS_LEFT_TRIGGER);
+		meshes[3].highlight_value = meshes[3].pull / 32767;
+		meshes[3].press = meshes[3].highlight_value;
 		//RIGHT TRIGGER
-		windows[i].model.meshes[4].pull = SDL_GameControllerGetAxis(windows[i].sdl_controller, SDL_CONTROLLER_AXIS_TRIGGERRIGHT);
-		windows[i].model.meshes[4].highlight_value = windows[i].model.meshes[4].pull / 32767;
-		windows[i].model.meshes[4].press = windows[i].model.meshes[4].highlight_value;
-		//BUTTONS
+		meshes[4].pull = SDL_GetGamepadAxis(gp, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER);
+		meshes[4].highlight_value = meshes[4].pull / 32767;
+		meshes[4].press = meshes[4].highlight_value;
+		//BUTTONS (SDL_GAMEPAD_BUTTON_SOUTH .. SDL_GAMEPAD_BUTTON_TOUCHPAD map to mesh slots 9..29)
 		for (int b=0; b<21; b++){
-			if(SDL_GameControllerGetButton(windows[i].sdl_controller, (SDL_GameControllerButton)b)){
-				windows[i].model.meshes[9 + b].press = 1.0f;
-				windows[i].model.meshes[9 + b].highlight_value = 1.0f;
-			}else{
-				windows[i].model.meshes[9 + b].press = 0.0f;
-				windows[i].model.meshes[9 + b].highlight_value = 0.0f;
-			}
+			bool pressed = SDL_GetGamepadButton(gp, (SDL_GamepadButton)b);
+			meshes[9 + b].press = pressed ? 1.0f : 0.0f;
+			meshes[9 + b].highlight_value = pressed ? 1.0f : 0.0f;
+		}
+		//SECOND TOUCHPAD CLICK (Steam Controller 2026 / Steam Deck right trackpad = MISC2)
+		bool pad2_pressed = SDL_GetGamepadButton(gp, SDL_GAMEPAD_BUTTON_MISC2);
+		meshes[MESH_TOUCHPAD2].press = pad2_pressed ? 1.0f : 0.0f;
+		meshes[MESH_TOUCHPAD2].highlight_value = pad2_pressed ? 1.0f : 0.0f;
+		//CAPACITIVE STICK TOUCH (Valve controllers): faint highlight on the stick caps
+		if (gamepad_has_valve_capsense(gp)){
+			if (meshes[16].press == 0.0f && SDL_GetGamepadButton(gp, SDL_GAMEPAD_BUTTON_MISC3))
+				meshes[16].highlight_value = 0.35f;
+			if (meshes[17].press == 0.0f && SDL_GetGamepadButton(gp, SDL_GAMEPAD_BUTTON_MISC4))
+				meshes[17].highlight_value = 0.35f;
 		}
 		//TOUCH POINTS
-		int touch_pads = SDL_GameControllerGetNumTouchpads(windows[i].sdl_controller);
-		if(touch_pads > 0){
-			SDL_GameControllerGetTouchpadFinger(windows[i].sdl_controller, 
-												0, 
-												0, 
-												&windows[i].model.meshes[30].touch_state, 
-												&windows[i].model.meshes[30].touch_X, 
-												&windows[i].model.meshes[30].touch_Y, 
-												nullptr);
-			if(windows[i].model.meshes[30].touch_state > 0){
-				if(windows[i].model.meshes[29].press){
-					windows[i].model.meshes[30].highlight_value = 0;
-				}else{
-					windows[i].model.meshes[30].highlight_value = 1;
-				}
-				windows[i].model.meshes[30].visible = true;
-			}else{
-				windows[i].model.meshes[30].highlight_value = 0;
-				windows[i].model.meshes[30].visible = false;
-			}
-			SDL_GameControllerGetTouchpadFinger(windows[i].sdl_controller, 
-												0, 
-												1, 
-												&windows[i].model.meshes[31].touch_state, 
-												&windows[i].model.meshes[31].touch_X, 
-												&windows[i].model.meshes[31].touch_Y, 
-												nullptr);
-			if(windows[i].model.meshes[31].touch_state > 0){
-				if(windows[i].model.meshes[29].press){
-					windows[i].model.meshes[31].highlight_value = 0;
-				}else{
-					windows[i].model.meshes[31].highlight_value = 1;
-				}windows[i].model.meshes[31].visible = true;
-			}else{
-				windows[i].model.meshes[31].highlight_value = 0;
-				windows[i].model.meshes[31].visible = false;
-			}
+		int touch_pads = SDL_GetNumGamepadTouchpads(gp);
+		if(touch_pads >= 2){
+			// Two separate trackpads (Steam Controller 2026, Steam Deck):
+			// touch point 1 follows the left pad, touch point 2 the right pad.
+			update_touch_point(meshes[MESH_TOUCH_POINT1], meshes[MESH_TOUCHPAD], gp, 0, 0);
+			update_touch_point(meshes[MESH_TOUCH_POINT2], meshes[MESH_TOUCHPAD2], gp, 1, 0);
+		}else if(touch_pads == 1){
+			// One trackpad with two fingers (DualShock 4 / DualSense)
+			update_touch_point(meshes[MESH_TOUCH_POINT1], meshes[MESH_TOUCHPAD], gp, 0, 0);
+			update_touch_point(meshes[MESH_TOUCH_POINT2], meshes[MESH_TOUCHPAD], gp, 0, 1);
+		}else{
+			meshes[MESH_TOUCH_POINT1].visible = meshes[MESH_TOUCH_POINT1].touch_state > 0;
+			meshes[MESH_TOUCH_POINT2].visible = meshes[MESH_TOUCH_POINT2].touch_state > 0;
 		}
 	}
 
@@ -454,26 +535,42 @@ void controller_window_input(){
 }
 
 void controller_sdl_events(SDL_Event* event){
-	if(event->type == SDL_CONTROLLERDEVICEADDED){
-		std::cout << "game controller added." << std::endl;
-		
-		int game_controllers = 0;
-		for (int i = 0; i < SDL_NumJoysticks(); i++){
-			if (SDL_IsGameController(i)){
-				game_controllers++;
+	if(event->type == SDL_EVENT_GAMEPAD_ADDED){
+		std::cout << "game controller added: " << event->gdevice.which << std::endl;
+		// Give the new controller to every window that has none (or whose
+		// controller went away), e.g. a Steam Controller waking up / pairing
+		// with its Puck after the overlay was started.
+		for(unsigned i=0; i<windows.size(); ++i){
+			if(windows[i].sdl_controller == nullptr || !SDL_GamepadConnected(windows[i].sdl_controller)){
+				controller_window_open_gamepad(windows[i], event->gdevice.which);
 			}
 		}
-		if(game_controllers == 1){
+	}else if(event->type == SDL_EVENT_GAMEPAD_REMOVED){
+		std::cout << "game controller removed: " << event->gdevice.which << std::endl;
+		for(unsigned i=0; i<windows.size(); ++i){
+			if(windows[i].sdl_controller != nullptr && SDL_GetGamepadID(windows[i].sdl_controller) == event->gdevice.which){
+				SDL_CloseGamepad(windows[i].sdl_controller);
+				windows[i].sdl_controller = nullptr;
+				// fall back to another connected controller if there is one
+				SDL_JoystickID other = pick_default_gamepad();
+				if(other != 0 && other != event->gdevice.which)
+					controller_window_open_gamepad(windows[i], other);
+			}
+		}
+	}else if(event->type == SDL_EVENT_GAMEPAD_SENSOR_UPDATE){
+		if(event->gsensor.sensor == SDL_SENSOR_GYRO){
 			for(unsigned i=0; i<windows.size(); ++i){
-				windows[i].sdl_controller = SDL_GameControllerOpen(0);
-				if(windows[i].sdl_controller != NULL){
-					windows[i].default_mapping = SDL_GameControllerMapping(windows[i].sdl_controller);
-					if (SDL_GameControllerHasSensor(windows[i].sdl_controller, SDL_SENSOR_GYRO)){
-						SDL_GameControllerSetSensorEnabled(windows[i].sdl_controller, SDL_SENSOR_GYRO, (SDL_bool)SDL_TRUE);
-					}
-				}else{
-					std::cout << "couldn't open sdl controller" << std::endl;
-					std::cout << SDL_GetError() << std::endl;
+				if(windows[i].sdl_controller != nullptr && SDL_GetGamepadID(windows[i].sdl_controller) == event->gsensor.which){
+					integrate_gyro_sample(windows[i], event->gsensor.data, event->gsensor.sensor_timestamp);
+				}
+			}
+		}else if(event->gsensor.sensor == SDL_SENSOR_ACCEL){
+			for(unsigned i=0; i<windows.size(); ++i){
+				if(windows[i].sdl_controller != nullptr && SDL_GetGamepadID(windows[i].sdl_controller) == event->gsensor.which){
+					windows[i].accel_data[0] = event->gsensor.data[0];
+					windows[i].accel_data[1] = event->gsensor.data[1];
+					windows[i].accel_data[2] = event->gsensor.data[2];
+					windows[i].accel_time = event->gsensor.sensor_timestamp;
 				}
 			}
 		}

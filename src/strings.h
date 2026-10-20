@@ -2,8 +2,9 @@
 #define STRINGS_H
 
 #include <string>
+#include "model.h"
 
-std::string mesh_names[32] = {
+std::string mesh_names[MESH_COUNT] = {
     "top shell",
     "bottom shell",
     "extra",
@@ -35,7 +36,8 @@ std::string mesh_names[32] = {
     "paddle 4",
     "touchpad",
     "touch point 1",
-    "touch point 2"
+    "touch point 2",
+    "touchpad 2"
 };
 
 std::string shell_names[3]= {

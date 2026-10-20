@@ -1,0 +1,16 @@
+Steam Controller (2026) model
+=============================
+
+Adapted from the official Steam Controller CAD files released by Valve Corporation:
+https://gitlab.steamos.cloud/SteamHardware/SteamController
+
+Original material (c) Valve Corporation, licensed under the Creative Commons
+Attribution-NonCommercial-ShareAlike 4.0 International License (CC BY-NC-SA 4.0):
+https://creativecommons.org/licenses/by-nc-sa/4.0/
+
+Changes: the single CAD solid was split into separately moving parts (buttons,
+sticks, trackpads, bumpers, triggers, grip buttons), openings were capped, the
+mesh was decimated and re-scaled, and overlay metadata (info.txt) was added.
+This adapted model is likewise licensed under CC BY-NC-SA 4.0. It is not
+affiliated with or endorsed by Valve. Unlike the rest of this repository
+(MIT), the files in this folder may not be used commercially.

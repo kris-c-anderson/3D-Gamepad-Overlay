@@ -63,7 +63,7 @@ typedef struct controller_window_struct{
 	GLFWwindow* glfw_window;
 	unsigned ID;
 
-	SDL_GameController* sdl_controller = nullptr;
+	SDL_Gamepad* sdl_controller = nullptr;
 	std::string default_mapping;
 				
 	bool left_click = false;
@@ -108,7 +108,7 @@ typedef struct controller_window_struct{
 	bool gyro_toggled = false;
 	bool gyro_enabled = false;
 	float gyro_data[3] = {0.0f, 0.0f, 0.0f};
-	Uint64 gyro_time = 0;
+	Uint64 gyro_time = 0; // sensor timestamp (ns) of the last integrated gyro sample, 0 = none yet
 	int reset_gyro_button1 = -1;
 	int reset_gyro_button2 = -1;
 	int gyro_correction = 5;
@@ -158,6 +158,16 @@ controller_window* getControllerWindow(unsigned ID);
 void controller_window_input();
 
 void controller_sdl_events(SDL_Event* event);
+
+// Opens the gamepad with the given SDL joystick instance ID for this window
+// (closing whatever it had before) and enables its motion sensors.
+void controller_window_open_gamepad(controller_window &w, SDL_JoystickID id);
+
+// Picks the most sensible gamepad to auto-open (skips Steam's virtual pads).
+SDL_JoystickID pick_default_gamepad();
+
+// Safe wrapper: SDL returns NULL for a missing/unopened gamepad.
+std::string gamepad_name(SDL_Gamepad* gamepad);
 
 void removeControllerWindow(unsigned ID);
 

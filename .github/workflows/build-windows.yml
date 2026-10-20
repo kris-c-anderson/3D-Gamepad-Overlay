@@ -1,0 +1,34 @@
+name: Build (Windows)
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install MinGW-w64 cross compiler
+        run: sudo apt-get update && sudo apt-get install -y mingw-w64
+
+      - name: Build 3dco.exe
+        run: |
+          x86_64-w64-mingw32-g++-posix -std=c++17 -O2 -mwindows \
+            src/glad.c src/imgui/*.cpp src/*.cpp \
+            -I include -I src/imgui -o 3dco.exe 3dco.res \
+            -static lib/libSDL3.dll.a -L lib -lglfw3 -lgdi32 -lopengl32
+
+      - name: Package
+        run: |
+          mkdir -p dist/3D-Gamepad-Overlay
+          cp 3dco.exe SDL3.dll icon.png LICENSE README.md dist/3D-Gamepad-Overlay/
+          cp -r models dist/3D-Gamepad-Overlay/
+          rm -rf "dist/3D-Gamepad-Overlay/models/DualShock 4/backup"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: 3D-Gamepad-Overlay-windows
+          path: dist/

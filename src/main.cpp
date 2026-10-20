@@ -12,7 +12,16 @@
 bool gQuit = false;
 
 void InitializeProgram(){
-	if(SDL_Init(SDL_INIT_JOYSTICK | SDL_INIT_GAMECONTROLLER) < 0){
+	// The overlay is almost never the focused window (the game is), so keep
+	// receiving controller input while in the background.
+	SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+	// Make sure SDL's own HIDAPI drivers are used for Valve hardware
+	// (Steam Controller 2026 / "Triton", incl. the Puck dongle) so we get
+	// gyro, both trackpads, grip buttons and capacitive touch.
+	SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI, "1");
+	SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_STEAM, "1");
+
+	if(!SDL_Init(SDL_INIT_JOYSTICK | SDL_INIT_GAMEPAD | SDL_INIT_SENSOR)){
         printf("Error: %s\n", SDL_GetError());
         exit(1);
     }

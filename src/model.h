@@ -14,6 +14,17 @@
 
 #include "shader.h"
 
+// Number of mesh slots every model has. Slots 0-31 are the original layout;
+// slot 32 ("touchpad 2") was added for controllers with a second trackpad
+// (Steam Controller 2026). Older models simply leave it empty.
+#define MESH_COUNT 33
+
+// Mesh slot indices that are referenced directly in code
+#define MESH_TOUCHPAD      29
+#define MESH_TOUCH_POINT1  30
+#define MESH_TOUCH_POINT2  31
+#define MESH_TOUCHPAD2     32
+
 typedef struct pos_struct{
     GLfloat x = 0;
     GLfloat y = 0;

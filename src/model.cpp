@@ -1,7 +1,7 @@
 #include "model.h"
 #include "stb_image.h"
 
-std::string model_filenames[32] = {
+std::string model_filenames[MESH_COUNT] = {
     "top_shell.obj",
     "bottom_shell.obj",
     "extra.obj",
@@ -33,7 +33,8 @@ std::string model_filenames[32] = {
     "paddle4.obj",
     "touchpad.obj",
     "touch_point1.obj",
-    "touch_point2.obj"
+    "touch_point2.obj",
+    "touchpad2.obj"
 };
 
 void loadModel(Model &m, std::string path){
@@ -41,7 +42,7 @@ void loadModel(Model &m, std::string path){
     for(int i=m.meshes.size(); i>0; i--){
         m.meshes.pop_back();
     }
-    for(int i=0; i<32; i++){
+    for(int i=0; i<MESH_COUNT; i++){
         Mesh new_mesh;
         if(i==0){ //TOP SHELL
             new_mesh.material.color[0] = 0.8f;
@@ -138,6 +139,8 @@ void loadMesh(Mesh &m, std::string path){
                         ind.push_back(std::stoi(value) - 1);
                     }
                 }
+                while (ind.size() < 3)
+                    ind.push_back(-1);
                 Vertex v;
                 v.position  = ind[0];
                 v.texcoord = ind[1];
@@ -147,20 +150,32 @@ void loadMesh(Mesh &m, std::string path){
         }
 	}
     
-    GLfloat vertex_data[vertices.size() * 8];
+    // Heap buffers (the old stack VLAs could overflow the 1 MB Windows stack
+    // on dense meshes). Missing normal/texcoord indices (e.g. "f 1//1") fall
+    // back to sane defaults instead of reading out of bounds.
+    std::vector<GLfloat> vertex_data(vertices.size() * 8, 0.0f);
     for(unsigned long i = 0; i<vertices.size(); i++){
-        vertex_data[0 + (8 * i)] = positions[vertices[i].position].x;
-        vertex_data[1 + (8 * i)] = positions[vertices[i].position].y;
-        vertex_data[2 + (8 * i)] = positions[vertices[i].position].z;
-        vertex_data[3 + (8 * i)] = normals[vertices[i].normal].x;
-        vertex_data[4 + (8 * i)] = normals[vertices[i].normal].y;
-        vertex_data[5 + (8 * i)] = normals[vertices[i].normal].z;
-        vertex_data[6 + (8 * i)] = texcoords[vertices[i].texcoord].x;
-        vertex_data[7 + (8 * i)] = texcoords[vertices[i].texcoord].y;
+        const Vertex &v = vertices[i];
+        if(v.position >= 0 && v.position < (int)positions.size()){
+            vertex_data[0 + (8 * i)] = positions[v.position].x;
+            vertex_data[1 + (8 * i)] = positions[v.position].y;
+            vertex_data[2 + (8 * i)] = positions[v.position].z;
+        }
+        if(v.normal >= 0 && v.normal < (int)normals.size()){
+            vertex_data[3 + (8 * i)] = normals[v.normal].x;
+            vertex_data[4 + (8 * i)] = normals[v.normal].y;
+            vertex_data[5 + (8 * i)] = normals[v.normal].z;
+        }else{
+            vertex_data[4 + (8 * i)] = 1.0f;
+        }
+        if(v.texcoord >= 0 && v.texcoord < (int)texcoords.size()){
+            vertex_data[6 + (8 * i)] = texcoords[v.texcoord].x;
+            vertex_data[7 + (8 * i)] = texcoords[v.texcoord].y;
+        }
     }
     
     m.elements = indices.size();
-    GLuint index_data[m.elements];
+    std::vector<GLuint> index_data(m.elements);
     for(unsigned long i = 0; i<m.elements; i++){
         index_data[i] = indices[i];
     }
@@ -171,8 +186,8 @@ void loadMesh(Mesh &m, std::string path){
 
 	glBindBuffer(GL_ARRAY_BUFFER, m.vbo);
 	glBufferData(GL_ARRAY_BUFFER,
-                 sizeof(vertex_data),
-                 vertex_data,
+                 vertex_data.size() * sizeof(GLfloat),
+                 vertex_data.empty() ? nullptr : vertex_data.data(),
                  GL_STATIC_DRAW);
     //vertex attribute
 	glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 8 * sizeof(GLfloat), (void*)0);
@@ -186,7 +201,7 @@ void loadMesh(Mesh &m, std::string path){
 
     glGenBuffers(1, &m.ebo);
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, m.ebo);
-    glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(index_data), index_data, GL_STATIC_DRAW);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, index_data.size() * sizeof(GLuint), index_data.empty() ? nullptr : index_data.data(), GL_STATIC_DRAW);
 
 	glBindVertexArray(0);
 }
@@ -199,7 +214,7 @@ void readInfo(Model &m, std::string path){
         while (info_file){
             std::string line;
             std::getline(info_file, line);
-            for(int i=0; i<32; i++){ 
+            for(int i=0; i<MESH_COUNT; i++){ 
                 if(line == model_filenames[i]){ 
                     for(int p=0; p<3; p++){ 
                         std::getline(info_file, line);
@@ -243,7 +258,7 @@ void writeInfo(Model &m, std::string path){
     std::string file_path = path;
     file_path.append("/info.txt");
     std::ofstream info_file = std::ofstream(file_path);
-    for(int i = 0; i<32; i++){ 
+    for(int i = 0; i<MESH_COUNT; i++){ 
         info_file << model_filenames[i].c_str() << "\n";
         for(int pos=0; pos<3; pos++){ 
             info_file << m.meshes[i].position[pos] << "\n";
@@ -342,6 +357,15 @@ void drawMesh(Mesh m, glm::mat4 motion, GLuint shader){
         model = glm::translate(model, glm::vec3(m.travel[0] * m.press, m.travel[1] * m.press, m.travel[2] * m.press));
         //TRIGGER PULL
         model = glm::rotate(model, m.pull / -32767 * m.trigger_max, glm::vec3(1.0f, 0.0f, 0.0f));
+    }
+    //TOUCH AREA ORIENTATION: touch points never pop up, so their popup
+    //rotation doubles as the orientation of the trackpad plane they slide on
+    //(the Steam Controller 2026 pads are tilted ~15 degrees). All-zero for
+    //flat touchpads, so older models are unaffected.
+    if(!m.popup && (m.touch_width > 0.0f || m.touch_height > 0.0f)){
+        model = glm::rotate(model, m.popup_rotation[0], glm::vec3(1.0f, 0.0f, 0.0f));
+        model = glm::rotate(model, m.popup_rotation[1], glm::vec3(0.0f, 1.0f, 0.0f));
+        model = glm::rotate(model, m.popup_rotation[2], glm::vec3(0.0f, 0.0f, 1.0f));
     }
     //TOUCH POINTS
     if(m.touch_state > 0){
