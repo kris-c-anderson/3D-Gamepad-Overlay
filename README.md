@@ -43,10 +43,6 @@ The `Steam Controller (2026)` model is converted from
 (CC BY-NC-SA 4.0, see `models/Steam Controller (2026)/LICENSE.txt`) with
 `tools/steam_controller_model/convert_valve_cad.py`.
 
-Windows builds are produced by GitHub Actions (`.github/workflows/build-windows.yml`);
-download the `3D-Gamepad-Overlay-windows` artifact from the latest run.
-Linux/macOS builds need SDL 3.4+ and GLFW 3 development packages.
-
 Enjoy!
 
-Larf
+Kris
